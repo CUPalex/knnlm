@@ -157,6 +157,13 @@ class DataTrainingArguments:
             "value if set."
         },
     )
+    start_eval_samples: int = field(
+        default=0,
+        metadata={
+            "help": "Start selecting subset for evaluation from this index, used only together with max_eval_samples "
+            "for debugging or evaluation on a subset."
+        },
+    )
 
     block_size: Optional[int] = field(
         default=None,
@@ -217,6 +224,7 @@ class KNNArguments:
     knn_temp: float = field(default=1.0)
     # Args for building the faiss index:
     build_index: bool = field(default=False)
+    build_index_on_the_go: bool = field(default=False)
     # faiss_index: str = field(default="checkpoints/index")
     ncentroids: int = field(default=4096)
     code_size: int = field(default=64)
@@ -235,6 +243,12 @@ class KNNArguments:
     num_clusters: int = field(default=500000)
     sample_size: int = field(default=20000000)
     members: str = field(default=None)
+
+    # Semem args:
+    semem_thres: float = field(default=-1.5)
+
+    # For debugging
+    save_eval_data: bool = field(default=False)
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -551,7 +565,11 @@ def main():
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = lm_datasets[data_args.eval_subset]
         if data_args.max_eval_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
+            eval_dataset = eval_dataset.select(range(data_args.start_eval_samples, data_args.max_eval_samples))
+        # We want the eval items on which we train the index to be
+        # as representative as possible
+        if knn_args.build_index_on_the_go:
+            eval_dataset = eval_dataset.shuffle(seed=42)
 
     # Initialize our Trainer
     trainer = Trainer(
@@ -581,9 +599,14 @@ def main():
             no_load_keys=knn_args.no_load_keys, move_dstore_to_mem=knn_args.move_dstore_to_mem, knn_gpu=knn_args.knn_gpu,
             recompute_dists=knn_args.recompute_dists,
             k=knn_args.k, lmbda=knn_args.lmbda, knn_temp=knn_args.knn_temp, probe=knn_args.probe)
-    elif knn_args.save_knnlm_dstore or knn_args.build_index:
+    elif knn_args.save_knnlm_dstore or knn_args.build_index or knn_args.build_index_on_the_go or knn_args.save_eval_data:
         knn_wrapper = KNNSaver(dstore_size=knn_args.dstore_size, dstore_dir=knn_args.dstore_dir, 
-            dimension=dimension, knn_keytype=knn_args.knn_keytype)
+            dimension=dimension, knn_keytype=knn_args.knn_keytype,
+            build_dstore=knn_args.save_knnlm_dstore, save_eval_data=knn_args.save_eval_data,
+            build_index_on_the_go=knn_args.build_index_on_the_go,
+            semem_thres=knn_args.semem_thres,
+            ncentroids=knn_args.ncentroids, code_size=knn_args.code_size, probe=knn_args.probe,
+            num_keys_to_add_at_a_time=knn_args.num_keys_to_add_at_a_time)
     
     if knn_wrapper is not None:
         knn_wrapper.break_into(model)
@@ -616,7 +639,8 @@ def main():
         metrics = trainer.evaluate()
 
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+        
+        metrics["eval_samples"] = min(max_eval_samples - data_args.start_eval_samples, len(eval_dataset) - data_args.start_eval_samples)
         try:
             perplexity = math.exp(metrics["eval_loss"])
         except OverflowError:
