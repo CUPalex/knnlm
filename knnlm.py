@@ -8,6 +8,8 @@ from torch import nn
 from enum import Enum, auto
 from pathlib import Path
 
+import pickle
+
 import faiss
 import faiss.contrib.torch_utils
 
@@ -42,7 +44,8 @@ class KNNWrapper(object):
             knn_sim_func=None, knn_keytype=None,
             no_load_keys=False, move_dstore_to_mem=False, knn_gpu=True,
             recompute_dists = False,
-            k=1024, lmbda=0.25, knn_temp=1.0, probe=32):
+            k=1024, lmbda=0.25, knn_temp=1.0, probe=32, save_eval_data=False,
+            save_eval_data_path=None):
         self.dstore_size = dstore_size
         self.dstore_dir = dstore_dir
         self.dimension = dimension
@@ -67,6 +70,11 @@ class KNNWrapper(object):
         self.activation_capturer = None
         self.is_encoder_decoder = None
         self.hook_handles = []
+
+        self.save_eval_data = save_eval_data
+        if self.save_eval_data:
+            self.save_eval_data_path = save_eval_data_path
+            self.what_to_save = {}
 
         dist_type_to_dist_func = {
             DIST.l2: KNNWrapper.l2,
@@ -190,6 +198,30 @@ class KNNWrapper(object):
         knn_log_probs, _ = self.knns_to_log_prob(knns, neg_dists)
         
         interpolated_scores = KNNWrapper.interpolate(knn_log_probs, lm_logits, self.lmbda) # (nonpad, vocab)
+
+        if self.save_eval_data:
+            to_save_in_iter = dict(
+                lm_log_probs=lm_logits.squeeze(0).to("cpu"),
+                knn_log_probs=knn_log_probs.to("cpu"),
+                dists=dists.to("cpu"),
+                knns=knns.to("cpu"),
+                labels=self.labels[:, shift:][self.labels[:, shift:] != -100].to("cpu"),
+                queries=queries.squeeze(0).to("cpu"),
+                interpolated_scores=interpolated_scores.to("cpu")
+            )
+
+            if self.what_to_save == {}:
+                for key in to_save_in_iter:
+                    self.what_to_save[key] = to_save_in_iter[key]
+                    if key != "labels":
+                        self.what_to_save[key] = self.what_to_save[key].to(torch.float32)
+            else:
+                for key in to_save_in_iter:
+                    self.what_to_save[key] = torch.cat([self.what_to_save[key], to_save_in_iter[key]], dim=0)
+                    if key != "labels":
+                        self.what_to_save[key] = self.what_to_save[key].to(torch.float32)
+            
+
         output[nonpad_mask] = interpolated_scores
         return output 
 
@@ -206,6 +238,9 @@ class KNNWrapper(object):
         self.hook_handles.append(handle)
 
     def break_out(self):
+        if self.save_eval_data:
+            with open(self.save_eval_data_path, "wb") as file:
+                pickle.dump(self.what_to_save, file)
         for h in self.hook_handles:
             h.remove()
         if self.model is not None and self.model.broken_into is not None:
@@ -272,7 +307,10 @@ class KNNWrapper(object):
     
 
 class KNNSaver(object):
-    def __init__(self, dstore_size, dstore_dir, dimension, knn_keytype=None):
+    def __init__(self, dstore_size, dstore_dir, dimension,
+                 build_dstore, save_eval_data, build_index_on_the_go,
+                 semem_thres, ncentroids, code_size, probe, num_keys_to_add_at_a_time,
+                 knn_keytype=None):
         self.dstore_size = dstore_size
         self.dstore_dir = dstore_dir
         self.dimension = dimension
@@ -280,10 +318,32 @@ class KNNSaver(object):
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        self.build_dstore = build_dstore
+        self.build_index_on_the_go = build_index_on_the_go
+        if self.build_dstore or self.build_index_on_the_go:
+            self.cur_dstore_size = 0
+            self.dstore_size = None
+            self.combined_dataset = False
+
+        self.save_eval_data = save_eval_data
+
+        self.num_keys_to_add_at_a_time = num_keys_to_add_at_a_time
+        if self.build_index_on_the_go:
+            logger.info('Building index')
+            # Initialize faiss index
+            quantizer = faiss.IndexFlatL2(self.dimension)
+            self.index = faiss.IndexIVFPQ(quantizer, self.dimension,
+                ncentroids, code_size, 8)
+            self.index.nprobe = probe
+
+            self.total_keys_added = 0
+
+        if semem_thres is not None:
+            self.semem_thres = semem_thres
+
         self.model = None
         self.activation_capturer = None
         self.is_encoder_decoder = None
-        self.dstore_idx = 0
         self.dstore_keys = None
         self.dstore_vals = None
         self.labels = None
@@ -311,18 +371,22 @@ class KNNSaver(object):
         final_layer = KNNWrapper.get_model_last_layer(model.config.model_type)(model)
         self.register_hook(final_layer, self.post_forward_hook)
 
-        keys_vals_prefix = get_dstore_path(self.dstore_dir, model.config.model_type, self.dstore_size, self.dimension)
-        keys_filename = f'{keys_vals_prefix}_keys.npy'
-        vals_filename = f'{keys_vals_prefix}_vals.npy'
-        if os.path.exists(keys_filename) and os.path.exists(vals_filename):
-            mode = 'r'
+        if self.build_dstore or self.build_index_on_the_go:
+            self.temp_save_dir_prefix = get_temp_dstore_path(self.dstore_dir, model.config.model_type, self.dimension)
+            if os.path.exists(self.temp_save_dir_prefix):
+                raise ValueError('Directory for saving dstore alredy exists. Please provide non-existent path.')
+            else:
+                Path(self.temp_save_dir_prefix).mkdir(parents=True, exist_ok=True)
         else:
-            mode = 'w+'
-            Path(keys_filename).parent.mkdir(parents=True, exist_ok=True)
-        
-        self.dstore_keys = np.memmap(keys_filename, dtype=np.float16, mode=mode, shape=(self.dstore_size, self.dimension))
-        self.dstore_vals = np.memmap(vals_filename, dtype=np.int32, mode=mode, shape=(self.dstore_size, 1))
-
+            self.keys_vals_prefix = get_dstore_path(self.dstore_dir, model.config.model_type, self.dstore_size, self.dimension)
+            keys_filename = f'{self.keys_vals_prefix}_keys.npy'
+            vals_filename = f'{self.keys_vals_prefix}_vals.npy'
+            if os.path.exists(keys_filename) and os.path.exists(vals_filename):
+                self.dstore_keys = np.memmap(keys_filename, dtype=np.float16, mode='r', shape=(self.dstore_size, self.dimension))
+                self.dstore_vals = np.memmap(vals_filename, dtype=np.int32, mode='r', shape=(self.dstore_size, 1))
+            else:
+                raise ValueError(f'Could not read the provided datastore. Path to the datastore {keys_filename} or {vals_filename} does not exist.')
+            
     def pre_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if labels is None:
             raise ValueError('labels must be provided when saving a datastore. Are you using --predict_with_generate by mistake? If so, disable it')
@@ -341,29 +405,195 @@ class KNNSaver(object):
         keys = captured_keys[nonpad_mask]
         values = captured_values[nonpad_mask]
 
-        batch_time_size = keys.shape[0]
-        # if shape[0] == args.tokens_per_sample:
-        if self.dstore_idx + batch_time_size > self.dstore_size:
-            batch_time_size = max(self.dstore_size - self.dstore_idx, 0)
-            keys = keys[:batch_time_size]
-            values = values[:batch_time_size]
-        try:
-            self.dstore_keys[self.dstore_idx:(batch_time_size + self.dstore_idx)] = keys.cpu().numpy().astype(np.float16)
-            self.dstore_vals[self.dstore_idx:(batch_time_size + self.dstore_idx)] = values.unsqueeze(-1).cpu().numpy().astype(np.int32)
-        except ValueError as ex:
-            logger.error(f'Error saving datastore with mode {self.dstore_keys.mode}, did you try to save an already existing datastore?')
-            logger.error(f'Delete the files {self.dstore_keys.filename} and {self.dstore_vals.filename} and try again')
-            raise ex
+        if self.save_eval_data or self.semem_thres is not None:
+            lm_logits = torch.nn.functional.log_softmax(output, dim=-1)[:, shift:].flatten(0, 1) # (batch * time, vocab)
+            lm_scores = lm_logits[torch.arange(lm_logits.shape[0]), captured_values] # (batch * time)
 
-        self.dstore_idx += batch_time_size
+        if self.semem_thres is not None:
+            lm_scores_without_pad = lm_scores[nonpad_mask]
+            captured_keys = captured_keys[lm_scores_without_pad < self.semem_thres]
+            captured_values = captured_values[lm_scores_without_pad < self.semem_thres]
+            logger.info(f"Saving {sum(lm_scores_without_pad < self.semem_thres) / lm_scores_without_pad.shape[0]:.3f}")
+
+        batch_time_size = keys.shape[0]
+        if self.build_dstore:
+            if batch_time_size == 0:
+                logger.info("Nothing to write")
+            else:
+                keys_arr = np.memmap(f"{self.temp_save_dir_prefix}_temp_keys_{self.cur_dstore_size}_{batch_time_size}.npy",
+                                dtype=np.float16, mode="w+",
+                                shape=(batch_time_size, self.dimension))
+                vals_arr = np.memmap(f"{self.temp_save_dir_prefix}_temp_vals_{self.cur_dstore_size}_{batch_time_size}.npy",
+                            dtype=np.int32, mode="w+",
+                            shape=(batch_time_size, 1))
+
+                keys_arr[:,:] = keys.cpu().numpy().astype(np.float16)
+                vals_arr[:,:] = values.unsqueeze(-1).cpu().numpy().astype(np.int32)
+
+                del keys_arr
+                del vals_arr
+
+                self.cur_dstore_size += batch_time_size
+                
+        if self.build_index_on_the_go:
+            num_batches = (batch_time_size // self.num_keys_to_add_at_a_time + \
+                            int(batch_time_size % self.num_keys_to_add_at_a_time != 0))
+            batches = [batch_time_size % self.num_keys_to_add_at_a_time]
+            batches.extend([self.num_keys_to_add_at_a_time for _ in range(num_batches - 1)])
+
+            print(batches, batch_time_size, self.num_keys_to_add_at_a_time,
+                    self.cur_dstore_size, self.total_keys_added,
+                    self.index.is_trained)
+        
+            for i, batch in enumerate(batches):
+                keys_arr = np.memmap(f"{self.temp_save_dir_prefix}_temp_keys_{self.cur_dstore_size}_{batch}.npy",
+                            dtype=np.float16, mode="w+",
+                            shape=(batch, self.dimension))
+                vals_arr = np.memmap(f"{self.temp_save_dir_prefix}_temp_vals_{self.cur_dstore_size}_{batch}.npy",
+                            dtype=np.int32, mode="w+",
+                            shape=(batch, 1))
+
+                keys_arr[:,:] = keys[sum(batches[:i]):sum(batches[:i]) + batch, :].cpu().numpy().astype(np.float16)
+                vals_arr[:,:] = values[sum(batches[:i]):sum(batches[:i]) + batch].unsqueeze(-1).cpu().numpy().astype(np.int32)
+
+                del keys_arr
+                del vals_arr
+
+                self.cur_dstore_size += batch
+                if self.cur_dstore_size - self.total_keys_added >= self.num_keys_to_add_at_a_time:
+                    self.update_index()
+
         
         return output
+
+    def combine_dataset(self):
+        logger.info('Combining dataset...')
+        self.dstore_size = self.cur_dstore_size
+        self.keys_vals_prefix = get_dstore_path(self.dstore_dir, self.model.config.model_type, self.dstore_size, self.dimension)
+
+        Path(self.keys_vals_prefix).parent.mkdir(parents=True, exist_ok=True)
+
+        self.dstore_keys = np.memmap(f"{self.keys_vals_prefix}_keys.npy",
+                        dtype=np.float16, mode="w+",
+                        shape=(self.dstore_size, self.dimension))
+        self.dstore_vals = np.memmap(f"{self.keys_vals_prefix}_vals.npy",
+                        dtype=np.int32, mode="w+",
+                        shape=(self.dstore_size, 1))
+
+        dir_name = self.temp_save_dir_prefix[:self.temp_save_dir_prefix.rfind("/")]
+        for file in os.listdir(dir_name):
+            # file = f"{self.temp_save_dir_prefix}_temp_keys_{cur_size}_{batch_time_size}.npy"
+            if "_temp_keys_" not in file:
+                continue
+            cur_size = int(file[file.find("_keys_") + len("_keys_"):file.rfind("_")])
+            batch_size = int(file[file.rfind("_") + 1:file.find(".npy")])
+
+            keys = np.memmap(f"{dir_name}/{file}", dtype=np.float16, mode='r',
+                                shape=(batch_size, self.dimension))
+            vals = np.memmap(f"{dir_name}/{file.replace('keys', 'vals')}", dtype=np.int32, mode='r',
+                                shape=(batch_size, 1))
+            
+            self.dstore_keys[cur_size:cur_size + batch_size] = keys
+            self.dstore_vals[cur_size:cur_size + batch_size] = vals
+            os.remove(f"{dir_name}/{file.replace('keys', 'vals')}")
+            os.remove(f"{dir_name}/{file}")
+
+        self.combined_dataset = True
+        logger.info('Combined dataset')
+
+    def write_index(self):
+        index_name = get_index_path(self.dstore_dir, self.model.config.model_type,
+                                        self.cur_dstore_size, self.dimension) 
+        Path(index_name).parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f'Writing Index to {index_name}')
+        start = time.time()
+        faiss.write_index(self.index, f'{index_name}')
+        logger.info(f'Writing index took {time.time() - start} s')
+
+        logger.info('Moving vals...')
+        self.dstore_size = self.cur_dstore_size
+        self.keys_vals_prefix = get_dstore_path(self.dstore_dir, self.model.config.model_type,
+                                                self.dstore_size, self.dimension)
+        dstore_vals = np.memmap(f"{self.keys_vals_prefix}_vals.npy",
+                        dtype=np.int32, mode="w+",
+                        shape=(self.dstore_size, 1))
+        vals_to_copy = np.memmap(f"{self.temp_save_dir_prefix}_temp_vals_{self.cur_dstore_size}.npy",
+                        dtype=np.int32, mode="r",
+                        shape=(self.cur_dstore_size, 1))
+        dstore_vals[:,:] = vals_to_copy
+
+        del vals_to_copy
+        os.remove(f"{self.temp_save_dir_prefix}_temp_vals_{self.cur_dstore_size}.npy")
+
+        logger.info('Moved vals')
+
+    def update_index(self):
+        dstore_keys = np.memmap(f"{self.temp_save_dir_prefix}_temp_keys.npy",
+                        dtype=np.float16, mode="w+",
+                        shape=(self.cur_dstore_size - self.total_keys_added, self.dimension))
+        dstore_vals = np.memmap(f"{self.temp_save_dir_prefix}_temp_vals_{self.cur_dstore_size}.npy",
+                        dtype=np.int32, mode="w+",
+                        shape=(self.cur_dstore_size, 1))
+        
+        if self.total_keys_added > 0:
+            combined_vals = f"{self.temp_save_dir_prefix}_temp_vals_{self.total_keys_added}.npy"
+            vals = np.memmap(combined_vals, dtype=np.int32, mode='r',
+                                    shape=(self.total_keys_added, 1))
+            dstore_vals[:self.total_keys_added] = vals
+            del vals
+            os.remove(combined_vals)
+        
+
+        dir_name = self.temp_save_dir_prefix[:self.temp_save_dir_prefix.rfind("/")]
+        cur_size = 0
+        for file in os.listdir(dir_name):
+            # file = f"{self.temp_save_dir_prefix}_temp_keys_{cur_size}_{batch_time_size}.npy"
+            if "_temp_keys_" not in file:
+                continue
+            batch_size = int(file[file.rfind("_") + 1:file.find(".npy")])
+
+            keys = np.memmap(f"{dir_name}/{file}", dtype=np.float16, mode='r',
+                                  shape=(batch_size, self.dimension))
+            vals = np.memmap(f"{dir_name}/{file.replace('keys', 'vals')}", dtype=np.int32, mode='r',
+                                  shape=(batch_size, 1))
+            
+            dstore_keys[cur_size:cur_size + batch_size] = keys
+            dstore_vals[self.total_keys_added + cur_size:self.total_keys_added + cur_size + batch_size] \
+                = vals
+            os.remove(f"{dir_name}/{file.replace('keys', 'vals')}")
+            os.remove(f"{dir_name}/{file}")
+            cur_size += batch_size
+
+        self.total_keys_added += cur_size
+
+        if not self.index.is_trained:
+            logger.info('Training Index')
+            np.random.seed(42)
+            start = time.time()
+            # Faiss does not handle adding keys in fp16 as of writing this.
+            self.index.train(torch.tensor(dstore_keys.astype(np.float32)))
+            logger.info(f'Training took {time.time() - start} s')
+
+        logger.info('Adding Keys')
+        start_time = time.time()
+        self.index.add_with_ids(torch.tensor(dstore_keys.astype(np.float32)), torch.arange(dstore_keys.shape[0]))
+        logger.info(f'Adding took {time.time() - start_time} s')
+
+        del dstore_vals
+        del dstore_keys
+        os.remove(f"{self.temp_save_dir_prefix}_keys.npy")
 
     def register_hook(self, layer, func, pre=False):
         handle = layer.register_forward_pre_hook(func) if pre else layer.register_forward_hook(func)
         self.hook_handles.append(handle)
     
     def break_out(self):
+        if self.build_dstore and not self.combined_dataset:
+            self.combine_dataset()
+        if self.build_index_on_the_go:
+            if self.total_keys_added < self.cur_dstore_size:
+                self.update_index()
+            self.write_index()
         for h in self.hook_handles:
             h.remove()
         if self.model is not None and self.model.broken_into is not None:
@@ -372,6 +602,9 @@ class KNNSaver(object):
 
     def build_index(self, num_keys_to_add_at_a_time=1000000, 
             ncentroids=4096, seed=1, code_size=64, probe=32):
+        if self.build_dstore and not self.combined_dataset:
+            self.combine_dataset()
+            
         logger.info('Building index')
         index_name = get_index_path(self.dstore_dir, self.model.config.model_type, self.dstore_size, self.dimension) 
         
@@ -432,6 +665,9 @@ class ActivationCapturer(nn.Module):
 
 def get_dstore_path(dstore_dir, model_type, dstore_size, dimension):
     return f'{dstore_dir}/dstore_{model_type}_{dstore_size}_{dimension}'
+
+def get_temp_dstore_path(dstore_dir, model_type, dimension):
+    return f'{dstore_dir}/dstore_{model_type}_{dimension}'
 
 def get_index_path(dstore_dir, model_type, dstore_size, dimension):
     return f'{dstore_dir}/index_{model_type}_{dstore_size}_{dimension}.indexed'

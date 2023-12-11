@@ -249,6 +249,7 @@ class KNNArguments:
 
     # For debugging
     save_eval_data: bool = field(default=False)
+    save_eval_data_path: str = field(default=None)
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -592,17 +593,18 @@ def main():
             k=knn_args.k, lmbda=knn_args.lmbda, knn_temp=knn_args.knn_temp, probe=knn_args.probe,
             no_pointer=knn_args.no_pointer, min_knns=knn_args.min_knns, max_knns=knn_args.max_knns,
             members=knn_args.members)
-    elif knn_args.knn:
+    elif knn_args.knn or knn_args.save_eval_data:
         knn_wrapper = KNNWrapper(dstore_size=knn_args.dstore_size, dstore_dir=knn_args.dstore_dir, 
             dimension= dimension, 
             knn_sim_func=knn_args.knn_sim_func, knn_keytype=knn_args.knn_keytype,
             no_load_keys=knn_args.no_load_keys, move_dstore_to_mem=knn_args.move_dstore_to_mem, knn_gpu=knn_args.knn_gpu,
             recompute_dists=knn_args.recompute_dists,
-            k=knn_args.k, lmbda=knn_args.lmbda, knn_temp=knn_args.knn_temp, probe=knn_args.probe)
+            k=knn_args.k, lmbda=knn_args.lmbda, knn_temp=knn_args.knn_temp, probe=knn_args.probe, save_eval_data=knn_args.save_eval_data,
+            save_eval_data_path=knn_args.save_eval_data_path)
     elif knn_args.save_knnlm_dstore or knn_args.build_index or knn_args.build_index_on_the_go or knn_args.save_eval_data:
         knn_wrapper = KNNSaver(dstore_size=knn_args.dstore_size, dstore_dir=knn_args.dstore_dir, 
             dimension=dimension, knn_keytype=knn_args.knn_keytype,
-            build_dstore=knn_args.save_knnlm_dstore, save_eval_data=knn_args.save_eval_data,
+            build_dstore=knn_args.save_knnlm_dstore,
             build_index_on_the_go=knn_args.build_index_on_the_go,
             semem_thres=knn_args.semem_thres,
             ncentroids=knn_args.ncentroids, code_size=knn_args.code_size, probe=knn_args.probe,
@@ -660,7 +662,8 @@ def main():
             logger.info(f'{i}: {tokenizer.decode(beam_output)}')
 
     if knn_args.build_index:
-        knn_wrapper.build_index()
+        knn_wrapper.build_index(num_keys_to_add_at_a_time=knn_args.num_keys_to_add_at_a_time, 
+            ncentroids=knn_args.ncentroids, seed=1, code_size=knn_args.code_size, probe=knn_args.probe)
 
     if knn_args.cluster_dstore:
         knn_wrapper.cluster_dstore(num_clusters=knn_args.num_clusters, sample_size=knn_args.sample_size, model=model)
