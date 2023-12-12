@@ -54,6 +54,7 @@ from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
+from peft import LoraConfig
 
 from knnlm import KNNWrapper, KNNSaver, KEY_TYPE, DIST
 from retomaton import RetomatonWrapper
@@ -245,7 +246,7 @@ class KNNArguments:
     members: str = field(default=None)
 
     # Semem args:
-    semem_thres: float = field(default=-1.5)
+    semem_thres: float = field(default=None)
 
     # For debugging
     save_eval_data: bool = field(default=False)
@@ -255,7 +256,6 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, KNNArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -417,7 +417,15 @@ def main():
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
+            device_map="cuda:0"
         )
+        lora_config = LoraConfig(
+                target_modules= ["k_proj"],
+                inference_mode=True
+                # init_lora_weights=False
+        )
+        model.add_adapter(lora_config, adapter_name="dummy")
+        training_args.fp16=True
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())

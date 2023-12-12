@@ -174,6 +174,7 @@ class KNNWrapper(object):
         lm_logits = output
         lm_logits = torch.nn.functional.log_softmax(lm_logits, dim=-1) # (batch, time, vocab)
         queries = self.activation_capturer.captured # (batch, time, dim)
+        queries = queries.to(torch.float32)
 
         if self.labels is None:
             nonpad_mask = torch.cat([
@@ -198,6 +199,7 @@ class KNNWrapper(object):
         knn_log_probs, _ = self.knns_to_log_prob(knns, neg_dists)
         
         interpolated_scores = KNNWrapper.interpolate(knn_log_probs, lm_logits, self.lmbda) # (nonpad, vocab)
+        interpolated_scores = interpolated_scores.to(torch.float16)
 
         if self.save_eval_data:
             to_save_in_iter = dict(
@@ -302,13 +304,17 @@ class KNNWrapper(object):
         't5': {
             KEY_TYPE.last_ffn_input: (lambda model: model.base_model.decoder.block[-1].layer[2].DenseReluDense, True),
             KEY_TYPE.last_ffn_output: (lambda model: model.base_model.decoder.block[-1].layer[2], False),
+        },
+        'llama': {
+            KEY_TYPE.last_ffn_input: (lambda model: model.base_model.layers[-1].mlp, True),
+            KEY_TYPE.last_ffn_output: (lambda model: model.base_model.layers[-1], False),
         }
 }
     
 
 class KNNSaver(object):
     def __init__(self, dstore_size, dstore_dir, dimension,
-                 build_dstore, save_eval_data, build_index_on_the_go,
+                 build_dstore, build_index_on_the_go,
                  semem_thres, ncentroids, code_size, probe, num_keys_to_add_at_a_time,
                  knn_keytype=None):
         self.dstore_size = dstore_size
@@ -325,8 +331,6 @@ class KNNSaver(object):
             self.dstore_size = None
             self.combined_dataset = False
 
-        self.save_eval_data = save_eval_data
-
         self.num_keys_to_add_at_a_time = num_keys_to_add_at_a_time
         if self.build_index_on_the_go:
             logger.info('Building index')
@@ -338,8 +342,7 @@ class KNNSaver(object):
 
             self.total_keys_added = 0
 
-        if semem_thres is not None:
-            self.semem_thres = semem_thres
+        self.semem_thres = semem_thres
 
         self.model = None
         self.activation_capturer = None
@@ -405,15 +408,12 @@ class KNNSaver(object):
         keys = captured_keys[nonpad_mask]
         values = captured_values[nonpad_mask]
 
-        if self.save_eval_data or self.semem_thres is not None:
-            lm_logits = torch.nn.functional.log_softmax(output, dim=-1)[:, shift:].flatten(0, 1) # (batch * time, vocab)
-            lm_scores = lm_logits[torch.arange(lm_logits.shape[0]), captured_values] # (batch * time)
-
         if self.semem_thres is not None:
-            lm_scores_without_pad = lm_scores[nonpad_mask]
-            captured_keys = captured_keys[lm_scores_without_pad < self.semem_thres]
-            captured_values = captured_values[lm_scores_without_pad < self.semem_thres]
-            logger.info(f"Saving {sum(lm_scores_without_pad < self.semem_thres) / lm_scores_without_pad.shape[0]:.3f}")
+            lm_logits = torch.nn.functional.log_softmax(output, dim=-1)[:, shift:].flatten(0, 1)
+            lm_scores = lm_logits[nonpad_mask][torch.arange(lm_logits[nonpad_mask].shape[0]), values]
+            keys = keys[lm_scores < self.semem_thres]
+            values = values[lm_scores < self.semem_thres]
+            logger.info(f"Saving {sum(lm_scores < self.semem_thres) / lm_scores.shape[0]:.3f}")
 
         batch_time_size = keys.shape[0]
         if self.build_dstore:
@@ -581,7 +581,7 @@ class KNNSaver(object):
 
         del dstore_vals
         del dstore_keys
-        os.remove(f"{self.temp_save_dir_prefix}_keys.npy")
+        os.remove(f"{self.temp_save_dir_prefix}_temp_keys.npy")
 
     def register_hook(self, layer, func, pre=False):
         handle = layer.register_forward_pre_hook(func) if pre else layer.register_forward_hook(func)
